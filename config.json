@@ -1,0 +1,19 @@
+{
+    "OpenOCD": {
+        "FlashWrite": true,
+        "Init": true,
+        "Interface": "cmsis-dap.cfg",
+        "Reset": true,
+        "ResetHalt": true,
+        "Shutdown": true,
+        "Target": "stm32f1x.cfg",
+        "Transport": "swd",
+        "WaitHalt": true
+    },
+    "Settings": {
+        "AdapterSpeed": 10000,
+        "FlashHexFile": "D:\\usersData\\Documents\\Arduino\\temp\\build\\STMicroelectronics.stm32.GenF1\\temp.ino.hex",
+        "IsAutoFlashDownload": true,
+        "OpenOCDPath": "C:\\Users\\kiic\\source\\repos\\STM DAP烧录\\OpenOCD-20260302-0.12.0\\bin\\openocd.exe"
+    }
+}
