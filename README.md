@@ -25,7 +25,7 @@
 
 - **下载OpenOCD 源文件然后放到本软件目录下解压就行了**，至于重命名啥的也不需要，自动深度探测的（5个目录层级内），就像这样
 
-![image-20260617124405257](C:\Users\kiic\source\repos\STM DAP烧录\assets\image-20260617124405257.png)
+![image-20260617124405257](./assets\image-20260617124405257.png)
 
 - 将 OpenOCD 目录添加系统环境变量 PATH
 
@@ -35,4 +35,4 @@
 
 #### 界面预览：
 
-![image-20260617123831558](C:\Users\kiic\source\repos\STM DAP烧录\assets\image-20260617123831558.png)
+![image-20260617123831558](./assets\image-20260617123831558.png)
