@@ -25,7 +25,7 @@
 
 - **下载OpenOCD 源文件然后放到本软件目录下解压就行了**，至于重命名啥的也不需要，自动深度探测的（5个目录层级内），就像这样
 
-![image-20260617124405257](./assets\image-20260617124405257.png)
+<img width="468" height="196" alt="image-20260617124405257" src="https://github.com/user-attachments/assets/b25603db-95f4-4036-902f-323bc1185ad0" />
 
 - 将 OpenOCD 目录添加系统环境变量 PATH
 
@@ -34,5 +34,6 @@
   
 
 #### 界面预览：
+<img width="801" height="568" alt="image-20260617123831558" src="https://github.com/user-attachments/assets/09189bb6-6db7-4537-9e76-700470480e30" />
 
-![image-20260617123831558](./assets\image-20260617123831558.png)
+
