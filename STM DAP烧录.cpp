@@ -1,4 +1,4 @@
-﻿#include <windows.h>
+#include <windows.h>
 #include <process.h>
 #include <string>
 #include <iostream>
@@ -33,6 +33,8 @@
 #define IDC_CHECK_AUTO_DOWNLOAD    1011
 #define IDC_BTN_REST        1012
 #define IDC_BTN_REST_BOOT        1013
+#define IDC_BTN_STOP        1014
+#define IDC_LAST_FLASH_LABEL 1015
 
 #define CONFIG_FILE L"config.json"
 
@@ -55,6 +57,10 @@ std::wstring g_openocdPath = L"openocd.exe";
 std::wstring g_szCurrentFile = L"";
 
 BOOL g_bIsAutoFlashDownload = TRUE;
+
+HANDLE g_hCurrentProcess = NULL;   // 当前OpenOCD进程句柄
+DWORD g_lastFlashTick = 0;          // 上次成功烧录时间戳
+HWND g_hLastFlashLabel = NULL;      // 上次烧录时间标签
 
 // ====================== OpenOCD 命令参数结构体 ======================
 typedef struct _OpenOCDConfig {
@@ -106,19 +112,78 @@ struct FlashThreadParam {
     HWND hWnd;                     // 主窗口句柄
 };
 
+// 强制终止当前OpenOCD进程
+void StopOpenOCDProcess()
+{
+    if (g_hCurrentProcess != NULL)
+    {
+        TerminateProcess(g_hCurrentProcess, 0);
+        CloseHandle(g_hCurrentProcess);
+        g_hCurrentProcess = NULL;
+        g_bIsFlashing = FALSE;
+        AppendLog(L"\r\n已强制终止 OpenOCD 进程\r\n");
+        SetWindowTextW(g_hLabelStatus, L"状态：已停止");
+        EnableWindow(GetDlgItem(g_hWnd, IDC_BTN_STOP), FALSE);
+    }
+}
+
+// 刷新上次烧录时间显示
+void UpdateLastFlashLabel()
+{
+    if (!g_hLastFlashLabel) return;
+    if (g_lastFlashTick == 0)
+    {
+        SetWindowTextW(g_hLastFlashLabel, L"上次烧录：无");
+        return;
+    }
+    DWORD diffSec = (GetTickCount() - g_lastFlashTick) / 1000;
+    WCHAR szBuf[128];
+    if (diffSec < 60)
+        StringCchPrintfW(szBuf, _countof(szBuf), L"上次烧录：%u秒前", diffSec);
+    else if (diffSec < 3600)
+        StringCchPrintfW(szBuf, _countof(szBuf), L"上次烧录：%u分钟前", diffSec / 60);
+    else
+        StringCchPrintfW(szBuf, _countof(szBuf), L"上次烧录：%u小时前", diffSec / 3600);
+    SetWindowTextW(g_hLastFlashLabel, szBuf);
+}
+
+
 // 工作线程函数
 unsigned int __stdcall FlashThreadProc(void* lpParam) {
     std::unique_ptr<FlashThreadParam> param(static_cast<FlashThreadParam*>(lpParam));
 
     // 发送开始日志（可选）
-    PostMessage(param->hWnd, WM_APPEND_LOG, 0, (LPARAM)new std::wstring(L"------------------------------\r\n开始执行\r\n------------------------------\r\n"));
+    //PostMessage(param->hWnd, WM_APPEND_LOG, 0, (LPARAM)new std::wstring(L"------------------------------\r\n开始执行\r\n------------------------------\r\n"));
+    
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+
+    WCHAR timeBuf[32]{};
+    StringCchPrintfW(timeBuf, _countof(timeBuf),
+        L"%04d-%02d-%02d %02d:%02d:%02d",
+        st.wYear, st.wMonth, st.wDay,
+        st.wHour, st.wMinute, st.wSecond);
+
+    std::wstring* pLog = new std::wstring(
+        L"------------------------------\r\n"
+        L"[" + std::wstring(timeBuf) + L"] 开始执行\r\n"
+        L"------------------------------\r\n"
+    );
+    PostMessage(param->hWnd, WM_APPEND_LOG, 0, (LPARAM)pLog);
+
+
+    EnableWindow(GetDlgItem(g_hWnd, IDC_BTN_STOP), TRUE);
+
+
+    g_lastFlashTick = GetTickCount();
+    UpdateLastFlashLabel();
 
     // 管道创建
     SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
     HANDLE hReadOut, hWriteOut, hReadErr, hWriteErr;
     CreatePipe(&hReadOut, &hWriteOut, &sa, 0);
     CreatePipe(&hReadErr, &hWriteErr, &sa, 0);
-
+    g_hCurrentProcess = NULL;
     STARTUPINFOW si = { sizeof(STARTUPINFOW) };
     PROCESS_INFORMATION pi = { 0 };
     si.hStdOutput = hWriteOut;
@@ -143,7 +208,7 @@ unsigned int __stdcall FlashThreadProc(void* lpParam) {
         PostMessage(param->hWnd, WM_FLASH_DONE, 1, 0);  // 失败
         return 1;
     }
-
+    g_hCurrentProcess = pi.hProcess; // 新增：保存进程句柄
     // 读取标准输出和错误（非阻塞读取，但这里依旧使用阻塞读，但放在线程中不影响UI）
     char buf[4096];
     DWORD readBytes;
@@ -161,6 +226,7 @@ unsigned int __stdcall FlashThreadProc(void* lpParam) {
     }
 
     WaitForSingleObject(pi.hProcess, INFINITE);
+    g_hCurrentProcess = NULL; // 新增：进程已结束，清空全局句柄
     DWORD exitCode = 0;
     GetExitCodeProcess(pi.hProcess, &exitCode);
 
@@ -180,10 +246,21 @@ unsigned int __stdcall FlashThreadProc(void* lpParam) {
     // 为了更安全，可以将 SaveConfig 所需的数据打包，由主线程执行。这里简化，直接调用（因为主线程此时不写配置）。
     SaveConfig();
 
-    CloseHandle(hReadOut);
-    CloseHandle(hReadErr);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
+    try
+    {
+        CloseHandle(hReadOut);
+        CloseHandle(hReadErr);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    catch (const std::exception&)
+    {
+
+    }
+    catch (...) {
+
+    }
+
 
     PostMessage(param->hWnd, WM_FLASH_DONE, exitCode, 0);
     return 0;
@@ -191,6 +268,10 @@ unsigned int __stdcall FlashThreadProc(void* lpParam) {
 
 // 修改 RunOpenOCDFlash 为异步启动
 void RunOpenOCDFlash() {
+    
+    g_lastFlashTick = GetTickCount();
+    UpdateLastFlashLabel();
+
     if (g_bIsFlashing) {
         AppendLog(L"正在烧录中，请等待完成！\r\n");
         return;
@@ -740,7 +821,22 @@ void RunOpenOCDFlashSync() {
     AppendLog(L"工作目录: ");
     AppendLog(szWorkDir);
     AppendLog(L"\r\n");
-    AppendLog(L"------------------------------\r\n开始执行\r\n------------------------------\r\n");
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+
+    WCHAR timeBuf[32]{};
+    StringCchPrintfW(timeBuf, _countof(timeBuf),
+        L"%04d-%02d-%02d %02d:%02d:%02d",
+        st.wYear, st.wMonth, st.wDay,
+        st.wHour, st.wMinute, st.wSecond);
+
+    std::wstring* pLog = new std::wstring(
+        L"------------------------------\r\n"
+        L"[" + std::wstring(timeBuf) + L"] 开始执行\r\n"
+        L"------------------------------\r\n"
+    );
+
+    AppendLog(pLog->c_str());
 
     if (!bSuccess) {
         WCHAR szErr[512];
@@ -806,6 +902,7 @@ void RunOpenOCDComdSync(std::wstring szCmdLine) {
         return;
     }
 
+    EnableWindow(GetDlgItem(g_hWnd, IDC_BTN_STOP), TRUE);
 
     g_bIsFlashing = TRUE;
     SetWindowTextW(g_hLabelStatus, L"状态：正在执行中...");
@@ -843,7 +940,23 @@ void RunOpenOCDComdSync(std::wstring szCmdLine) {
     AppendLog(L"工作目录: ");
     AppendLog(szWorkDir);
     AppendLog(L"\r\n");
-    AppendLog(L"------------------------------\r\n开始执行\r\n------------------------------\r\n");
+
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+
+    WCHAR timeBuf[32]{};
+    StringCchPrintfW(timeBuf, _countof(timeBuf),
+        L"%04d-%02d-%02d %02d:%02d:%02d",
+        st.wYear, st.wMonth, st.wDay,
+        st.wHour, st.wMinute, st.wSecond);
+
+    std::wstring* pLog = new std::wstring(
+        L"------------------------------\r\n"
+        L"[" + std::wstring(timeBuf) + L"] 开始执行\r\n"
+        L"------------------------------\r\n"
+    );
+
+    AppendLog(pLog->c_str());
 
     if (!bSuccess) {
         WCHAR szErr[512];
@@ -857,6 +970,8 @@ void RunOpenOCDComdSync(std::wstring szCmdLine) {
         g_bIsFlashing = FALSE;
         return;
     }
+
+    g_hCurrentProcess = pi.hProcess; // 新增：保存进程句柄
 
     // 读取输出
     char buf[4096] = { 0 };
@@ -879,6 +994,7 @@ void RunOpenOCDComdSync(std::wstring szCmdLine) {
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD exitCode = 0;
     GetExitCodeProcess(pi.hProcess, &exitCode);
+    g_hCurrentProcess = NULL; // 新增：进程已结束，清空全局句柄
 
 
     WCHAR szResult[512] = { 0 };
@@ -894,6 +1010,7 @@ void RunOpenOCDComdSync(std::wstring szCmdLine) {
     AppendLog(szResult);
 
     SaveConfig();
+    EnableWindow(GetDlgItem(g_hWnd, IDC_BTN_STOP), FALSE);
 
     CloseHandle(hReadOut);
     CloseHandle(hReadErr);
@@ -1079,6 +1196,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         CreateWindowExW(0, L"BUTTON", L"REST", WS_VISIBLE | WS_CHILD | BS_FLAT , 660 - 69 , 95, 50, 30, hWnd, (HMENU)IDC_BTN_REST, NULL, NULL);
 
         CreateWindowExW(0, L"BUTTON", L"BOOT", WS_VISIBLE | WS_CHILD | BS_FLAT, 660 - 69 - 65, 95, 50, 30, hWnd, (HMENU)IDC_BTN_REST_BOOT, NULL, NULL);
+        
+        // 停止按钮（初始禁用，执行中启用）
+        CreateWindowExW(0, L"BUTTON", L"停止", WS_VISIBLE | WS_CHILD | BS_FLAT | WS_DISABLED,
+            660 - 69 - 65 - 65, 95, 50, 30, hWnd, (HMENU)IDC_BTN_STOP, NULL, NULL);
 
         g_hEditLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT20W", L"", WS_VISIBLE | WS_CHILD | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL | ES_NOHIDESEL, 10, 130, 780, 360, hWnd, (HMENU)IDC_LOG_EDIT, NULL, NULL);
         CHARFORMAT2W cf = { sizeof(CHARFORMAT2W) };
@@ -1095,6 +1216,36 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         CreateWindowExW(0, L"BUTTON", L"烧录完成时重启开发板", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
             160 + 10, 500, 160, 24, hWnd, (HMENU)IDC_CHECK_REBOOT, NULL, NULL);
         SendMessageW(GetDlgItem(hWnd, IDC_CHECK_REBOOT), BM_SETCHECK, g_openocdConfig.bReset ? BST_CHECKED : BST_UNCHECKED, 0);
+        
+        // 新增：上次烧录时间标签（右对齐）
+        g_hLastFlashLabel = CreateWindowExW(0, L"STATIC", L"上次烧录：无", WS_VISIBLE | WS_CHILD | SS_LEFT,
+            160 + 160 + 30, 500+3+1, 160, 24, hWnd, (HMENU)IDC_LAST_FLASH_LABEL, NULL, NULL);
+
+
+        SetTimer(hWnd, 1, 1000, NULL); // 每秒刷新上次烧录时间
+
+        // 全局
+        HFONT g_hEditFont = NULL;
+
+        // 先创建edit
+        g_hEditFilePath = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"EDIT",
+            L"",
+            WS_VISIBLE | WS_CHILD | ES_AUTOHSCROLL,
+            120, 10, 570, 24,
+            hWnd, (HMENU)IDC_EDIT_FILEPATH, NULL, NULL
+        );
+
+        // 创建小字体，lfHeight 负数=字符高度（推荐）
+        LOGFONTW lf{};
+        lf.lfHeight = -12;        // 字号，-12≈12px，越小字越小
+        lf.lfWeight = FW_NORMAL;
+        wcscpy_s(lf.lfFaceName, L"Segoe UI");
+        g_hEditFont = CreateFontIndirectW(&lf);
+
+        // 设置给edit，最后一个TRUE：通知控件重绘
+        SendMessageW(g_hEditFilePath, WM_SETFONT, (WPARAM)g_hEditFont, TRUE);
 
 
         // 统一字体
@@ -1175,6 +1326,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         }
 
+        if (id == IDC_BTN_STOP && notify == BN_CLICKED)
+        {
+            StopOpenOCDProcess();
+            break;
+        }
+
         if (id == IDC_BTN_BROWSE && notify == BN_CLICKED) {
             WCHAR szFileFilter[] = L"烧录文件(*.hex)\0*.hex\0二进制(*.bin)\0*.bin\0所有文件(*.*)\0*.*\0\0";
             WCHAR szFilePath[MAX_PATH] = { 0 };
@@ -1205,7 +1362,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
 
         if (id == IDC_BTN_REST && notify == BN_CLICKED) {
+            SYSTEMTIME st{};
+            GetLocalTime(&st);
+
+            WCHAR timeBuf[32]{};
+            StringCchPrintfW(timeBuf, _countof(timeBuf),
+                L"%04d-%02d-%02d %02d:%02d:%02d",
+                st.wYear, st.wMonth, st.wDay,
+                st.wHour, st.wMinute, st.wSecond);
+
+            std::wstring* pLog = new std::wstring(
+                L"------------------------------\r\n"
+                L"[" + std::wstring(timeBuf) + L"] 开始执行\r\n"
+                L"------------------------------\r\n"
+            );
+
+            AppendLog(pLog->c_str());
+
             AppendLog(L"\n开始执行设备重启...\r\n");
+
             WCHAR szCmdLine[4096] = { 0 };
             StringCchPrintfW(szCmdLine, 4096,
                 L"\"%s\" -c \"source [find interface/%ls]\" -c \"transport select %ls\" -c \"source [find target/%ls]\" -c \"adapter speed 1000\" -c init -c \"reset run\" -c shutdown",
@@ -1218,7 +1393,26 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         }
         if (id == IDC_BTN_REST_BOOT && notify == BN_CLICKED) {
+
+            SYSTEMTIME st{};
+            GetLocalTime(&st);
+
+            WCHAR timeBuf[32]{};
+            StringCchPrintfW(timeBuf, _countof(timeBuf),
+                L"%04d-%02d-%02d %02d:%02d:%02d",
+                st.wYear, st.wMonth, st.wDay,
+                st.wHour, st.wMinute, st.wSecond);
+
+            std::wstring* pLog = new std::wstring(
+                L"------------------------------\r\n"
+                L"[" + std::wstring(timeBuf) + L"] 开始执行\r\n"
+                L"------------------------------\r\n"
+            );
+
+            AppendLog(pLog->c_str());
+
             AppendLog(L"\n开始执行设备重启进入复位...\r\n");
+
             WCHAR szCmdLine[4096] = { 0 };
             // 使用 program 命令替代一长串的 flash write_image
             StringCchPrintfW(szCmdLine, 4096,
@@ -1259,14 +1453,26 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     case WM_FLASH_DONE: {
         g_bIsFlashing = FALSE;
-        // 可选：根据 wParam 退出码做额外处理
+        g_hCurrentProcess = NULL;
+        EnableWindow(GetDlgItem(g_hWnd, IDC_BTN_STOP), FALSE);
+        if (wParam == 0) // 烧录成功
+        {
+            g_lastFlashTick = GetTickCount();
+            UpdateLastFlashLabel();
+        }
         return 0;
+    }
+    case WM_TIMER:
+    {
+        UpdateLastFlashLabel();
+        break;
     }
     case WM_CLOSE:
         SaveConfig();
         DestroyWindow(hWnd);
         break;
     case WM_DESTROY:
+        KillTimer(hWnd, 1);
         PostQuitMessage(0);
         break;
     default:
